@@ -1,0 +1,14 @@
+# 忽略 Python 環境和編譯檔案
+__pycache__/
+*.pyc
+venv/
+.venv/
+.DS_Store
+
+# 忽略敏感資料
+config.ini
+.env
+token.txt
+# 由於您的 Bot Token 是寫在 bot.py 裡的變數中，
+# 理想情況下應該將 Token 移出程式碼，但如果不能移動，
+# 請確保 repository 是私有的 (Private)。
