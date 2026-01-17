@@ -39,6 +39,8 @@ N8N_LEARNING_WEBHOOK_URL = os.getenv("N8N_LEARNING_WEBHOOK_URL")
 GET_RESULT_URL = os.getenv("GET_RESULT_URL")
 N8N_READ_URL = os.getenv("N8N_READ_URL")
 
+N8N_ASSISTANT_WEBHOOK_URL = os.getenv("N8N_ASSISTANT_WEBHOOK_URL")
+
 # ==========================================
 # 🤖 Bot 初始化與設定
 # ==========================================
@@ -57,17 +59,33 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
     🔥 已加入: 自動維持 '輸入中...' 狀態的循環機制
     """
     
-    # 1. 統一取得 channel 與 user 物件
+# 1. 統一取得 channel, user 物件，以及正確的 Message ID
+    message_id = None  # 預設為 None
+
     if isinstance(message_or_interaction, discord.Interaction):
         context_obj = message_or_interaction
         channel = message_or_interaction.channel
         user = message_or_interaction.user
         content = ""
+        
+        # [關鍵差異]
+        # 如果是按鈕 (Button) 或選單，它會附著在一則訊息上 -> 我們抓那則訊息的 ID
+        if context_obj.message:
+            message_id = str(context_obj.message.id)
+        else:
+            # 如果是斜線指令 (Slash Command)，它沒有「原始訊息」可以回覆
+            # 這裡留空，N8N 那邊就不會執行 "Reply"，而是直接發新訊息
+            message_id = None 
+            
     else:
+        # 如果是一般訊息 (Message)
         context_obj = message_or_interaction
         channel = message_or_interaction.channel
         user = message_or_interaction.author
         content = message_or_interaction.content
+        
+        # 直接取得訊息 ID
+        message_id = str(context_obj.id)
 
     # =======================================================
     # ⏳ [核心修改] 啟動背景輸入訊號 (Typing Loop)
@@ -97,7 +115,8 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
         "user_name": user.name,
         "user_message": content,
         "action": action,
-        "thread_name": channel.name
+        "thread_name": channel.name,
+        "message_id": str(message_id)
     }
     if extra_data: payload.update(extra_data)
 
@@ -108,7 +127,9 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
             response.raise_for_status() 
             
             data = response.json()
-            
+            # 🛑 [FIX] 如果是「智慧助手」，N8N 已經用 HTTP Request 回覆了，Python 不用再發
+            if action == "general_assistant_query":
+                return
             # =======================================================
             # 解析回應 (這部分保持您原本的邏輯)
             # =======================================================
@@ -193,7 +214,7 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
                 if action == "submit_answer": 
                     reply_text += "\n\n✨ **恭喜！您已證明實力，請點擊下方按鈕結案。**"
             elif "review_challenge" in actions:
-                view_to_send = ChallengeView(task_index=current_task_index)
+                view_to_send = StudyRoomView(task_index=current_task_index)
             elif action in ["request_hint", "student_stuck"]:
                 view_to_send = None 
             elif action is None and thread_status.get(thread_id) != "completed":
@@ -1506,33 +1527,67 @@ async def my_notes(ctx):
 
 @bot.event
 async def on_message(message: discord.Message):
-    # 忽略 Bot 自己的訊息
-    if message.author.bot: # 更安全的方式是檢查 .bot 屬性
+    # 1. 絕對規則：忽略 Bot 自己的訊息
+    if message.author.bot:
         return
 
-    # 檢查是否為「私密答題討論串」中的訊息
+    # =================================================
+    # 優先級 1: 私密討論串 (Thread) 的既有邏輯
+    # =================================================
     if isinstance(message.channel, discord.Thread):
         thread_name = message.channel.name
 
+        # A. 規劃模式
         if thread_name.startswith("📝 [規劃中]"):
-            # 情況二：規劃對話邏輯
             await handle_n8n_backend(message, N8N_PLANNER_WEBHOOK_URL)
+            return  # 🔥 關鍵：處理完立刻結束，避免觸發後面的邏輯
 
-        # 針對學習室的路由
-        # 針對學習室的路由
+        # B. 學習模式
         elif thread_name.startswith("🚀 [學習中]"):
             t_id = str(message.channel.id)
-            # 檢查這個 Thread 目前是否正在進行審核
-            current_action = thread_status.get(t_id) # 如果沒設過，會是 None (即一般對話)
+            current_action = thread_status.get(t_id)
             
-            # 傳送當前的 action 給 n8n
             await handle_n8n_backend(
                 message, 
                 N8N_LEARNING_WEBHOOK_URL, 
                 action=current_action
             )
+            return  # 🔥 關鍵：處理完立刻結束
 
-    # 確保其他指令能正常運作
+        # C. 答題模式 (如果您有保留這個功能的話，建議補上以免失效)
+        elif thread_name.startswith("🧠 [答題中]"):
+            # 假設您的測驗 Webhook 變數是 N8N_EXAM_WEBHOOK_URL
+            await handle_n8n_backend(message, N8N_EXAM_WEBHOOK_URL)
+            return  # 🔥 關鍵：處理完立刻結束
+
+    # =================================================
+    # 優先級 2: 主頻道智慧助手 (新功能 ✨)
+    # =================================================
+    # 條件：Bot 被 @Mention，且上面的 Thread 邏輯沒有攔截到
+    if bot.user.mentioned_in(message):
+        
+        # 1. 清理訊息：移除 <@123456> 這種 Tag 字串，只留內容
+        clean_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
+        
+        # 2. 防呆：如果有人只 Tag 不說話
+        if not clean_content:
+            await message.reply("❓ 需要幫忙嗎？請直接輸入您的問題。")
+            return
+
+        # 3. 發送到新的 N8N 助手 Webhook
+        await handle_n8n_backend(
+            message, 
+            N8N_ASSISTANT_WEBHOOK_URL,  # 請確認 .env 已加入此變數
+            action="general_assistant_query",
+            extra_data={
+                "message_id": str(message.id)  # 傳送 ID 讓 N8N 可以用 "Reply" 回覆
+            }
+        )
+        return  # 處理完結束
+
+    # =================================================
+    # 優先級 3: Slash Commands (最後處理)
+    # =================================================
     await bot.process_commands(message)
 
 # ------------------------------------------------------------------
