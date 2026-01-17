@@ -257,6 +257,7 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
 # 註冊相關 View (Modal)
 # ==========================================
 # 1.註冊用的視窗 
+# 1. 註冊用的視窗 
 class RegisterModal(ui.Modal):
     def __init__(self):
         super().__init__(title="🎉 歡迎來到 SRL 學習助教")
@@ -274,15 +275,16 @@ class RegisterModal(ui.Modal):
         ))
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        # 1. 設定為公開回應 (ephemeral=False)
+        await interaction.response.defer(ephemeral=False)
         
         email = self.children[0].value
         name = self.children[1].value
         user_id = str(interaction.user.id)
-        # 不管是在 #general 還是某個 Thread，直接抓當下的 ID
         current_channel_id = str(interaction.channel.id)
-        # 呼叫 n8n 註冊 API
+
         try:
+            # 2. 呼叫 n8n 註冊 API
             async with httpx.AsyncClient() as client:
                 await client.post(
                     N8N_REGISTER_URL, 
@@ -295,9 +297,35 @@ class RegisterModal(ui.Modal):
                     timeout=70.0
                 )
             
-            await interaction.followup.send(f"✅ 註冊成功！你好 {name}，現在您可以開始學習 了。", ephemeral=True)
+            # 3. 準備指南 View
+            view = SRLGuideView()
+
+            # 🔥 修正點：interaction.followup.send 直接回傳的就是 message 物件
+            message = await interaction.followup.send(
+                f"🎉 **註冊成功！你好 {name}。**\n"
+                f"為了讓您快速上手，我們為您準備了 **SRL 三階段學習指南**，請點擊下方按鈕閱讀：",
+                embed=view.embeds[0], 
+                view=view
+            )
+
+            # 4. 嘗試自動釘選
+            try:
+                # 🔥 直接對 message 呼叫 pin()，不需要再找 original_response()
+                await message.pin(reason=f"用戶 {name} 的學習指南")
+                
+                # 發送確認訊息
+                await interaction.channel.send(f"✅ 已為 {name} 自動釘選學習指南！")
+                
+            except discord.Forbidden:
+                await interaction.channel.send("⚠️ 註冊成功，但 Bot 缺少權限無法自動釘選指南。")
+            except discord.HTTPException as e:
+                if e.code == 30003:
+                    await interaction.channel.send("⚠️ 註冊成功，但此頻道的釘選已滿 (50則)，無法釘選您的指南。")
+                else:
+                    await interaction.channel.send(f"⚠️ 註冊成功，但釘選失敗：{e}")
             
         except Exception as e:
+            # 發生錯誤時，因為已經 defer 過了，所以要用 followup 發送錯誤訊息
             await interaction.followup.send(f"❌ 註冊失敗，請聯繫管理員。({e})", ephemeral=True)
 
 # 2.註冊按鈕 View (當發現用戶未註冊時顯示)
@@ -308,6 +336,100 @@ class RegisterView(ui.View):
     @ui.button(label="📝 立即註冊", style=discord.ButtonStyle.primary)
     async def register_btn(self, button, interaction):
         await interaction.response.send_modal(RegisterModal())
+
+# 2-1 SRL 學習指南分頁系統 (SRLGuideView)
+class SRLGuideView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.current_page = 0
+        self.embeds = self._create_embeds()
+        self._update_buttons()
+
+    def _create_embeds(self):
+        """建立 SRL 三階段的 Embeds"""
+        
+        # --- Page 1: 準備階段 (Forethought) ---
+        embed1 = discord.Embed(
+            title="🌱 第一階段：準備與規劃 (Preparation)",
+            description="好的開始是成功的一半。在此階段，我們設定目標並準備教材。",
+            color=0x4caf50 # 綠色
+        )
+        embed1.add_field(
+            name="📂 1. 上傳教材",
+            value="使用 `/upload_textbook` 上傳 PDF。\n系統會自動建立索引，讓 AI 讀懂您的課本。",
+            inline=False
+        )
+        embed1.add_field(
+            name="🗓️ 2. 擬定計畫",
+            value="使用 `/start_plan` 啟動對話。\nAI 教練會協助您將教材拆解為具體的「待辦任務」，並設定學習策略。",
+            inline=False
+        )
+        embed1.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2921/2921222.png") # 規劃圖標
+        embed1.set_footer(text="第 1/3 頁 • 點擊下方按鈕翻頁")
+
+        # --- Page 2: 執行階段 (Performance) ---
+        embed2 = discord.Embed(
+            title="🔥 第二階段：執行與監控 (Performance)",
+            description="進入心流狀態，並善用工具解決困難。",
+            color=0xff9800 # 橘色
+        )
+        embed2.add_field(
+            name="📖 3. 進入學習室",
+            value="使用 `/start_study` 選擇任務。\n進入專注模式，隨時向 AI 提問、釐清觀念。",
+            inline=False
+        )
+        embed2.add_field(
+            name="🤖 4. 智慧助手 (新功能✨)",
+            value="**在主頻道直接 `@Bot` 並輸入問題。**\n遇到操作困難或不知道下一步該做什麼時，隨時召喚助手救援！",
+            inline=False
+        )
+        embed2.add_field(
+            name="⚔️ 5. 測驗挑戰",
+            value="使用 `/start_exam`。\n當您認為精通後，接受 AI 出題考核，這是證明實力與獲取高分的途徑。",
+            inline=False
+        )
+        embed2.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png") # 執行圖標
+        embed2.set_footer(text="第 2/3 頁 • 點擊下方按鈕翻頁")
+
+        # --- Page 3: 反思階段 (Reflection) ---
+        embed3 = discord.Embed(
+            title="📊 第三階段：反思與調整 (Reflection)",
+            description="透過數據回饋，優化下一輪的學習。",
+            color=0x2196f3 # 藍色
+        )
+        embed3.add_field(
+            name="📝 6. 查看成果",
+            value="使用 `/my_result`。\n查詢特定任務的 AI 詳細評語、強弱項分析與總結。",
+            inline=False
+        )
+        embed3.add_field(
+            name="📈 7. 個人儀表板",
+            value="使用 `/my_stats`。\n查看長期的學習進度條、累積積分與能力雷達圖。",
+            inline=False
+        )
+        embed3.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2921/2921226.png") # 數據圖標
+        embed3.set_footer(text="第 3/3 頁 • 祝您學習愉快！")
+
+        return [embed1, embed2, embed3]
+
+    def _update_buttons(self):
+        """根據頁數更新按鈕狀態"""
+        # 上一頁按鈕：第一頁時停用
+        self.children[0].disabled = (self.current_page == 0)
+        # 下一頁按鈕：最後一頁時停用
+        self.children[1].disabled = (self.current_page == len(self.embeds) - 1)
+
+    @ui.button(label="⬅️ 上一步", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, button, interaction):
+        self.current_page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+
+    @ui.button(label="下一步 ➡️", style=discord.ButtonStyle.primary)
+    async def next_button(self, button, interaction):
+        self.current_page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
 # 3.通用的檢查函式 (在每個指令前呼叫)
 # 您需要在 n8n 建立一個簡單的 GET API 來檢查 user_id 是否存在
@@ -606,7 +728,7 @@ class SmartNoteModal(ui.Modal):
             await interaction.followup.send(f"❌ 連線錯誤: {e}", ephemeral=True)
 
 # 5-1 筆記閱讀器
-# --- 核心：分頁閱讀器 (Idea 2) ---
+# --- 分頁閱讀器 ---
 class NotePaginationView(ui.View):
     def __init__(self, title, content, doc_url):
         super().__init__(timeout=300) # 5分鐘後按鈕失效
@@ -681,7 +803,7 @@ class NotePaginationView(ui.View):
         await interaction.response.edit_message(content="📕 筆記已關閉", embed=None, view=None)
 
 
-# --- 1. 筆記選擇選單 ---
+# --- 筆記選擇選單 ---
 class NoteSelect(ui.Select):
     def __init__(self, notes_data): # 👈 修正：這裡只需要 notes_data，不需要 user_name 了
         options = []
@@ -1264,80 +1386,29 @@ async def my_stats(ctx: discord.ApplicationContext):
         await ctx.respond("❌ 獲取數據失敗，請稍後再試。", ephemeral=True)
 
 # 指令: /show_guide 置頂學習指南
-@bot.slash_command(name="show_guide", description="顯示學習功能說明書")
+@bot.slash_command(name="show_guide", description="顯示 SRL 學習功能說明書 (分頁版)")
 async def show_guide(ctx: discord.ApplicationContext):
-    # 這是公開訊息，不用 ephemeral
     
-    # 1. 設計 Embed 內容
-    embed = discord.Embed(
-        title="🎓 SRL 學習助教：完全使用指南",
-        description=(
-            "歡迎來到自主學習頻道！本助手將協助您完成 **「準備 ➔ 執行 ➔ 反思」** 的高效學習循環。\n"
-            "請參考以下步驟開始您的學習之旅："
-        ),
-        color=0x00b0f4 # 天藍色
-    )
-
-    # 區塊 0: 準備工作
-    embed.add_field(
-        name="🌱 第一步：準備與規劃 (Preparation)",
-        value=(
-            "**`/upload_textbook`**\n"
-            "📂 **上傳教材**：支援 PDF 格式。上傳後系統會自動建立索引，讓 AI 讀懂您的課本。\n"
-            "**`/start_plan`**\n"
-            "🗓️ **擬定計畫**：與 AI 教練對話，將教材拆解為具體的「待辦任務」，並設定學習策略。"
-        ),
-        inline=False
-    )
-
-    # 區塊 1: 執行學習
-    embed.add_field(
-        name="🔥 第二步：執行與監控 (Performance)",
-        value=(
-            "**`/start_study`**\n"
-            "📖 **學習室 (讀書模式)**：\n"
-            "進入專注狀態。您可以隨時向 AI 提問、釐清觀念。完成學習後點擊「✅ 完成任務」，系統會自動生成學習日誌。\n\n"
-            "**`/start_exam`**\n"
-            "⚔️ **測驗室 (挑戰模式)**：\n"
-            "當您認為已經精通某個任務時，請來此挑戰！AI 會即時出題考核，這是證明實力與獲取高分的唯一途徑。"
-        ),
-        inline=False
-    )
-
-    # 區塊 2: 成果反思
-    embed.add_field(
-        name="📊 第三步：反思與調整 (Reflection)",
-        value=(
-            "**`/my_result`**\n"
-            "📝 **查看單次成果**：查詢特定任務的 AI 詳細評語、強弱項分析與總結。\n"
-            "**`/my_stats`**\n"
-            "📈 **個人儀表板**：查看長期的學習進度條、累積積分與能力雷達圖。"
-        ),
-        inline=False
-    )
-    
-    # 底部提示
-    embed.add_field(
-        name="💡 小貼士",
-        value="• 首次使用請留意私訊，完成簡單註冊。\n• 學習室與測驗室皆具備 **自動記錄** 功能，請放心學習。",
-        inline=False
-    )
-    
-    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/4712/4712009.png") # 您的 Logo
+    # 1. 建立 View
+    view = SRLGuideView()
 
     try:
-        # 2. 發送訊息
-        response = await ctx.respond(embed=embed)
+        # 2. 發送訊息 (公開顯示)
+        response = await ctx.respond(
+            "🎓 **SRL 學習助教：完全使用指南**\n請使用下方按鈕切換學習階段：",
+            embed=view.embeds[0], 
+            view=view
+        )
 
-        # 3. 執行釘選 (Pin)
-        message = await response.original_response()
-        await message.pin(reason="SRL 學習指南置頂")
-        
-        # 4. 悄悄告訴老師成功了
-        await ctx.followup.send("✅ 指南已更新並自動釘選！", ephemeral=True)
+        # 3. 執行釘選 (Pin) - 選擇性功能
+        # 注意：如果 View 有 timeout，釘選後的按鈕過一段時間會失效。
+        # 這裡我們設 timeout=None，所以只要 Bot 沒重啟，按鈕都會活著。
+        try:
+            message = await response.original_response()
+            await message.pin(reason="SRL 學習指南置頂")
+        except discord.Forbidden:
+            pass # 沒權限釘選就算了，不報錯
 
-    except discord.Forbidden:
-        await ctx.respond("❌ 錯誤：Bot 缺少 `Manage Messages` (管理訊息) 權限，無法釘選。", ephemeral=True)
     except Exception as e:
         await ctx.respond(f"❌ 發生錯誤：{e}", ephemeral=True)
 
