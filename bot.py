@@ -52,9 +52,12 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ------------------------------------------------------------------
 
 async def handle_n8n_backend(message_or_interaction, target_url: str, action: str = None, extra_data: dict = None):
-    """將 Discord 訊息/互動打包，發送到 n8n 核心邏輯，並處理回應與 UI 狀態變更。"""
+    """
+    將 Discord 訊息/互動打包，發送到 n8n 核心邏輯，並處理回應與 UI 狀態變更。
+    🔥 已加入: 自動維持 '輸入中...' 狀態的循環機制
+    """
     
-    # 1. 統一取得 channel 與 user 物件 (兼容 Message 與 Interaction)
+    # 1. 統一取得 channel 與 user 物件
     if isinstance(message_or_interaction, discord.Interaction):
         context_obj = message_or_interaction
         channel = message_or_interaction.channel
@@ -66,12 +69,24 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
         user = message_or_interaction.author
         content = message_or_interaction.content
 
-    # 顯示輸入中
+    # =======================================================
+    # ⏳ [核心修改] 啟動背景輸入訊號 (Typing Loop)
+    # =======================================================
+    typing_task = None
+
     if isinstance(context_obj, discord.Interaction):
+        # 如果是 Slash Command 或按鈕，Defer 是最穩的 (維持 15 分鐘)
         if not context_obj.response.is_done():
             await context_obj.response.defer()
     else:
-        await channel.trigger_typing()
+        # 如果是「一般文字訊息」，必須靠這個 Loop 來騙過 Discord 的 10秒限制
+        async def keep_typing_loop():
+            while True:
+                await channel.trigger_typing()
+                await asyncio.sleep(9) # 每 9 秒刷新一次 (Discord timeout 是 10s)
+
+        # 啟動背景任務
+        typing_task = asyncio.create_task(keep_typing_loop())
 
     # 準備 Payload
     task_index_from_arg = extra_data.get("task_index") if extra_data else None
@@ -85,17 +100,17 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
         "thread_name": channel.name
     }
     if extra_data: payload.update(extra_data)
-    # print(f"🚀 [DEBUG] Sending to N8N: {payload}")
 
     try:
         async with httpx.AsyncClient() as client:
+            # 🔥 關鍵：Timeout 設長一點 (120秒)，給 AI 足夠時間思考
             response = await client.post(target_url, json=payload, timeout=120.0)
             response.raise_for_status() 
             
             data = response.json()
             
             # =======================================================
-            # 🛡️ [變數安全初始化]
+            # 解析回應 (這部分保持您原本的邏輯)
             # =======================================================
             raw_text = None
             feedback = None
@@ -103,10 +118,6 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
             is_passed = None
             actions = []
             reply_text = "（AI 處理完成，但未回傳文字）"
-            
-            # =======================================================
-            # 🔄 [核心修正] 智能讀取資料 (支援 Dict 與 JSON String)
-            # =======================================================
             
             # 1. 抓取原始欄位
             raw_content = (
@@ -118,7 +129,6 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
 
             # 2. 判斷型態並提取資料
             if isinstance(raw_content, dict):
-                # 情況 A: N8N 直接回傳了 JSON 物件 (Dict)
                 inner_data = raw_content
                 if "score" in inner_data: score = inner_data["score"]
                 if "is_passed" in inner_data: is_passed = inner_data["is_passed"]
@@ -126,9 +136,8 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
                 raw_text = feedback if feedback else str(inner_data)
 
             elif isinstance(raw_content, str):
-                # 情況 B: N8N 回傳了字串，嘗試解析是否為 JSON
                 cleaned_text = raw_content.strip()
-                if cleaned_text.startswith("```"): # 去除 Markdown
+                if cleaned_text.startswith("```"): 
                     cleaned_text = re.sub(r"^```(json)?|```$", "", cleaned_text, flags=re.MULTILINE).strip()
                 
                 if cleaned_text.startswith("{") and cleaned_text.endswith("}"):
@@ -139,11 +148,11 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
                         if "feedback" in inner_data: feedback = inner_data["feedback"]
                         raw_text = feedback if feedback else cleaned_text
                     except json.JSONDecodeError:
-                        raw_text = cleaned_text # 解析失敗就當普通文字
+                        raw_text = cleaned_text 
                 else:
                     raw_text = cleaned_text 
 
-            # 3. 補充：如果外層 data 就有 score/actions，優先權高於內層
+            # 3. 補充優先權
             if data.get("score") is not None: score = data.get("score")
             if data.get("is_passed") is not None: is_passed = data.get("is_passed")
             if data.get("actions"): actions = data.get("actions")
@@ -154,30 +163,22 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
             elif raw_text and isinstance(raw_text, str):
                 reply_text = raw_text
 
-            # =======================================================
-            # 🚩 邏輯判斷：根據分數決定 UI
-            # =======================================================
+            # 🚩 邏輯判斷
             if action == "submit_answer":
                 if score is not None: score = int(score)
-
-                # 如果 N8N 沒給 actions，我們自己推斷
                 if not actions: 
                     if is_passed is True or (score is not None and score >= 60):
                         actions.append("show_complete_button")
                     else:
                         actions.append("review_challenge")
 
-            # 取得 task_index
             current_task_index = str(data.get("task_index") or task_index_from_arg or "0")
             thread_id = str(channel.id)
 
-            # =======================================================
-            # 🎨 UI 美化與狀態更新
-            # =======================================================
+            # 🎨 UI 美化
             if action == "submit_answer" and score is not None:
                 status_emoji = "🎉" if score >= 90 else ("✅" if score >= 60 else "💪")
                 status_title = "表現優異" if score >= 90 else ("通過挑戰" if score >= 60 else "未達標準")
-                
                 reply_text = f"### {status_emoji} 評測結果：{score} 分 ({status_title})\n\n{reply_text}"
 
                 if score < 60:
@@ -185,29 +186,20 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
                 else:
                     thread_status[thread_id] = "completed"
 
-            # =======================================================
-            # 🛠️ 決定 View (按鈕介面)
-            # =======================================================
+            # 🛠️ 決定 View
             view_to_send = None
-            
             if "show_complete_button" in actions:
-                # 🔥 這裡傳入 target_url，解決衝突的關鍵
                 view_to_send = TaskCompleteView(target_url=target_url, task_index=current_task_index)
                 if action == "submit_answer": 
                     reply_text += "\n\n✨ **恭喜！您已證明實力，請點擊下方按鈕結案。**"
-
             elif "review_challenge" in actions:
                 view_to_send = ChallengeView(task_index=current_task_index)
-
             elif action in ["request_hint", "student_stuck"]:
                 view_to_send = None 
-
             elif action is None and thread_status.get(thread_id) != "completed":
                 pass 
 
-            # =======================================================
             # 📤 發送訊息
-            # =======================================================
             if isinstance(context_obj, discord.Interaction):
                 await context_obj.followup.send(reply_text, view=view_to_send)
             else:
@@ -225,6 +217,17 @@ async def handle_n8n_backend(message_or_interaction, target_url: str, action: st
         else:
             await channel.send(err_msg)
         print(f"[Error] handle_n8n_backend: {e}")
+
+    finally:
+        # =======================================================
+        # 🛑 [核心修改] 無論成功失敗，都要停止輸入狀態
+        # =======================================================
+        if typing_task:
+            typing_task.cancel()
+            try:
+                await typing_task # 確保任務乾淨結束
+            except asyncio.CancelledError:
+                pass
 
 # ------------------------------------------------------------------
 # 各種 UI View (處理結束或繼續的按鈕):
